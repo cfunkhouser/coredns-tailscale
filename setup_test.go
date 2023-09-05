@@ -14,6 +14,7 @@ func TestParseConfig(t *testing.T) {
 		want    Config
 		wantErr bool
 	}{
+		// Pathological cases
 		"empty": {
 			wantErr: true,
 		},
@@ -22,10 +23,6 @@ func TestParseConfig(t *testing.T) {
 				reload 1s
 				reload 2s
 			}`,
-			want: Config{
-				DefaultZone:    "corp.example.com.",
-				ReloadInterval: time.Second, // First time is used.
-			},
 			wantErr: true,
 		},
 		"repeated tag": {
@@ -33,34 +30,12 @@ func TestParseConfig(t *testing.T) {
 				tag foo foo.corp.example.com.
 				tag foo bar.corp.example.com.
 			}`,
-			want: Config{
-				DefaultZone: "corp.example.com.",
-				Zones: map[string]string{
-					"foo": "foo.corp.example.com.",
-				},
-			},
 			wantErr: true,
-		},
-		"default zone only": {
-			input: "tailscale corp.example.com.",
-			want: Config{
-				DefaultZone: "corp.example.com.",
-			},
-		},
-		"empty block": {
-			input: `tailscale corp.example.com. {
-				}`,
-			want: Config{
-				DefaultZone: "corp.example.com.",
-			},
 		},
 		"unknown option": {
 			input: `tailscale corp.example.com. {
 				foo bar
 			}`,
-			want: Config{
-				DefaultZone: "corp.example.com.",
-			},
 			wantErr: true,
 		},
 		"full block but no default zone": {
@@ -71,6 +46,23 @@ func TestParseConfig(t *testing.T) {
 				tag prod example.com.
 			}`,
 			wantErr: true,
+		},
+
+		// Sane cases
+		"default zone only": {
+			input: "tailscale corp.example.com.",
+			want: Config{
+				DefaultZone:    "corp.example.com.",
+				ReloadInterval: defaultReloadInterval,
+			},
+		},
+		"empty block": {
+			input: `tailscale corp.example.com. {
+				}`,
+			want: Config{
+				DefaultZone:    "corp.example.com.",
+				ReloadInterval: defaultReloadInterval,
+			},
 		},
 		"full example": {
 			input: `tailscale corp.example.com. {
@@ -91,9 +83,13 @@ func TestParseConfig(t *testing.T) {
 		},
 	} {
 		t.Run(tn, func(t *testing.T) {
-			got, err := parse(caddy.NewTestController("dns", tc.input))
-			if (err != nil) != tc.wantErr {
+			var got Config
+			if err := parse(caddy.NewTestController("dns", tc.input), &got); (err != nil) != tc.wantErr {
 				t.Errorf("unexpected error value: %v", err)
+			}
+			if tc.wantErr {
+				// Do not compare Config values when parse returns an error.
+				return
 			}
 			if diff := cmp.Diff(got, tc.want); diff != "" {
 				t.Errorf("mismatch: (-got,+want):\n%v", diff)
