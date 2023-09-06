@@ -5,6 +5,7 @@ package corednstailscale
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -16,44 +17,33 @@ import (
 	"tailscale.com/ipn/ipnstate"
 )
 
-// Config describes a mapping of Tailscale ACL tags to domain names on which to
+type record struct {
+	name   string
+	v4, v6 []netip.Addr
+}
+
+// Config describes a mapping of Tailscale ACL tags to DNS zones on which to
 // answer about hosts.
 type Config struct {
-	DefaultZone    string
-	Zones          map[string]string
+	// DefaultZone in which all peers should appear.
+	DefaultZone string
+
+	// Zones maps Tailscale ACL tags to additional zones in which tagged peers
+	// should appear in addition to the DefaultZone.
+	Zones map[string]string
+
+	// ReloadInterval at which polling for changes to peers should occur. Also
+	// used as the TTL for responses.
 	ReloadInterval time.Duration
 }
 
-// localClientish describes the subset of the Tailscale LocalClient used in this
-// package.
-type localClientish interface {
-	Status(context.Context) (*ipnstate.Status, error)
-}
-
-type host struct {
-	cname   string
-	a, aaaa []netip.Addr
-}
-
-type Tailscale struct {
-	Config
-
-	// Next handler in the chain.
-	Next plugin.Handler
-
-	client localClientish
-	done   chan any
-
-	sync.RWMutex
-	hosts map[string]*host
-}
-
-func peerDNSHostname(pdns string) string {
-	splits := strings.SplitN(pdns, ".", 2)
-	if len(splits) != 2 {
-		return ""
-	}
-	return splits[0]
+func answer(req *dns.Msg) *dns.Msg {
+	ans := &dns.Msg{}
+	ans.SetReply(req)
+	ans.Authoritative = true
+	ans.RecursionAvailable = false
+	ans.Compress = true
+	return ans
 }
 
 func bucketAddrs(addrs []netip.Addr) (v4, v6 []netip.Addr) {
@@ -74,44 +64,120 @@ func bucketAddrs(addrs []netip.Addr) (v4, v6 []netip.Addr) {
 	return
 }
 
-func buildHosts(config *Config, peers []*ipnstate.PeerStatus) map[string]*host {
-	if config == nil || len(peers) == 0 {
-		return nil
-	}
-	hosts := make(map[string]*host)
+func buildRecords(config *Config, peers []*ipnstate.PeerStatus) map[string]*record {
+	records := make(map[string]*record)
 	for _, peer := range peers {
-		pdns := peer.DNSName
-		if pdns == "" {
+		if peer.DNSName == "" {
 			continue
 		}
-		phn := peerDNSHostname(pdns)
+
+		tsdns := dns.CanonicalName(peer.DNSName)
+		phn := peerDNSHostname(tsdns)
 		if phn == "" {
-			fmt.Println(">>> no peer hostname")
 			continue
 		}
+
 		v4, v6 := bucketAddrs(peer.TailscaleIPs)
-		host := &host{
-			cname: pdns,
-			a:     v4,
-			aaaa:  v6,
+		host := &record{
+			name: tsdns,
+			v4:   v4,
+			v6:   v6,
 		}
 
-		// Insert default zone record
-		hosts[fmt.Sprintf("%s.%s", phn, config.DefaultZone)] = host
-
-		// Insert any additional records based on tags
+		records[dns.CanonicalName(fmt.Sprintf("%s.%s", phn, config.DefaultZone))] = host
+		if peer.Tags == nil {
+			continue
+		}
 		for _, tag := range peer.Tags.AsSlice() {
 			if zone := config.Zones[tag]; zone != "" {
-				hosts[fmt.Sprintf("%s.%s", phn, zone)] = host
+				records[dns.CanonicalName(fmt.Sprintf("%s.%s", phn, zone))] = host
 			}
 		}
 	}
-	return hosts
+	return records
 }
 
-func (ts *Tailscale) refresh() {
+func peerDNSHostname(pdns string) string {
+	splits := strings.SplitN(pdns, ".", 2)
+	if len(splits) != 2 {
+		return ""
+	}
+	return splits[0]
+}
+
+// clientish describes the subset of the Tailscale LocalClient used in this
+// package.
+type clientish interface {
+	Status(context.Context) (*ipnstate.Status, error)
+}
+
+// Tailscale plugin for coredns, which serves records for peer hosts in
+// custom DNS zones based on ACL tags.
+type Tailscale struct {
+	Config
+
+	// Next handler in the chain.
+	Next plugin.Handler
+
+	client clientish
+	done   chan any
+
+	sync.RWMutex // protects the following.
+	hosts        map[string]*record
+}
+
+func (ts *Tailscale) answerA(qn string, hr *record) []dns.RR {
+	ans := make([]dns.RR, len(hr.v4))
+	for i, addr := range hr.v4 {
+		ans[i] = &dns.A{
+			Hdr: dns.RR_Header{
+				Name:   qn,
+				Rrtype: dns.TypeA,
+				Class:  dns.ClassINET,
+				Ttl:    uint32(ts.ReloadInterval.Seconds()),
+			},
+			A: net.IP(addr.AsSlice()),
+		}
+	}
+	return ans
+}
+
+func (ts *Tailscale) answerAAAA(qn string, hr *record) []dns.RR {
+	ans := make([]dns.RR, len(hr.v6))
+	for i, addr := range hr.v6 {
+		ans[i] = &dns.AAAA{
+			Hdr: dns.RR_Header{
+				Name:   qn,
+				Rrtype: dns.TypeAAAA,
+				Class:  dns.ClassINET,
+				Ttl:    uint32(ts.ReloadInterval.Seconds()),
+			},
+			AAAA: net.IP(addr.AsSlice()),
+		}
+	}
+	return ans
+}
+
+func (ts *Tailscale) poll(t *time.Ticker) {
+	log.Debug("Polling started")
+	defer log.Debug("Polling stoped")
+	for {
+		select {
+		case <-t.C:
+			ts.reload()
+		case <-ts.done:
+			t.Stop()
+			return
+		}
+	}
+}
+
+func (ts *Tailscale) reload() {
+	log.Debug("Beginning peer record reload")
+	defer log.Debug("Peer record reload complete")
 	status, err := ts.client.Status(context.Background())
 	if err != nil {
+		log.Errorf("Failed fetching status from Tailscale Local API: %v", err)
 		return
 	}
 
@@ -121,40 +187,61 @@ func (ts *Tailscale) refresh() {
 		peers[i] = peer
 		i++
 	}
-	hosts := buildHosts(&ts.Config, peers)
+	if status.Self != nil {
+		peers = append(peers, status.Self)
+	}
+	hosts := buildRecords(&ts.Config, peers)
+	log.Infof("Build records for %d custom hosts", len(hosts))
 
 	ts.Lock()
 	defer ts.Unlock()
 	ts.hosts = hosts
 }
 
-func (ts *Tailscale) poll(t *time.Ticker) {
-	for {
-		select {
-		case <-t.C:
-			ts.refresh()
-		case <-ts.done:
-			t.Stop()
-			return
-		}
+func (ts *Tailscale) serveA(ctx context.Context, w dns.ResponseWriter, req *dns.Msg, qn string, hr *record) (int, error) {
+	ans := answer(req)
+	ans.Answer = append(ans.Answer, ts.answerA(qn, hr)...)
+	if err := w.WriteMsg(ans); err != nil {
+		return dns.RcodeServerFailure, err
 	}
+	return dns.RcodeSuccess, nil
 }
 
-func (ts *Tailscale) Startup() {
-	if ts.done == nil {
-		ts.done = make(chan any)
+func (ts *Tailscale) serveAAAA(ctx context.Context, w dns.ResponseWriter, req *dns.Msg, qn string, hr *record) (int, error) {
+	ans := answer(req)
+	ans.Answer = append(ans.Answer, ts.answerAAAA(qn, hr)...)
+	if err := w.WriteMsg(ans); err != nil {
+		return dns.RcodeServerFailure, err
 	}
-	go ts.poll(time.NewTicker(ts.Config.ReloadInterval))
+	return dns.RcodeSuccess, nil
 }
 
-func (ts *Tailscale) Shutdown() {
-	ts.done <- true
+func (ts *Tailscale) serveCNAME(ctx context.Context, w dns.ResponseWriter, req *dns.Msg, qn string, hr *record) (int, error) {
+	ans := answer(req)
+	ans.Answer = append(ans.Answer,
+		&dns.CNAME{
+			Hdr: dns.RR_Header{
+				Name:   qn,
+				Rrtype: dns.TypeCNAME,
+				Class:  dns.ClassINET,
+				Ttl:    uint32(ts.ReloadInterval.Seconds()),
+			},
+			Target: hr.name,
+		})
+	ans.Answer = append(ans.Answer, ts.answerA(qn, hr)...)
+	ans.Answer = append(ans.Answer, ts.answerAAAA(qn, hr)...)
+	if err := w.WriteMsg(ans); err != nil {
+		return dns.RcodeServerFailure, err
+	}
+	return dns.RcodeSuccess, nil
 }
 
+// Name of this plugin.
 func (*Tailscale) Name() string {
 	return name
 }
 
+// Ready returns true when the plugin is ready to serve.
 func (ts *Tailscale) Ready() bool {
 	ts.RLock()
 	defer ts.RUnlock()
@@ -163,40 +250,84 @@ func (ts *Tailscale) Ready() bool {
 	return ts.hosts != nil
 }
 
-func (ts *Tailscale) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
-	state := request.Request{W: w, Req: r}
-	if state.QClass() != dns.ClassINET {
-		return plugin.NextOrFailure(ts.Name(), ts.Next, ctx, w, r)
+// ServeDNS queries about Tailscale peers with custom domains. Satisfies the
+// coredns handler interface.
+func (ts *Tailscale) ServeDNS(ctx context.Context, w dns.ResponseWriter, req *dns.Msg) (int, error) {
+	if ts == nil || !ts.Ready() {
+		return plugin.NextOrFailure(ts.Name(), ts.Next, ctx, w, req)
 	}
 
-	// var canAnswer []*dns.Question
-	// for i := range r.Question {
-	// 	q := &r.Question[i]
-	// 	if q.Qclass != dns.ClassINET || !canAnswerForType[q.Qtype] {
-	// 		continue
-	// 	}
-	// 	cname, v4, v6 := ts.sh.Get(q.Name)
-	// 	switch q.Qtype {
-	// 	case dns.TypeCNAME:
-	// 		if cname != "" {
+	state := request.Request{W: w, Req: req}
+	if qc := state.QClass(); qc != dns.ClassINET && qc != dns.ClassANY {
+		log.Debugf("Skipping query of unsupported class: %v", qc)
+		return plugin.NextOrFailure(ts.Name(), ts.Next, ctx, w, req)
+	}
 
-	// 		}
-	// 	}
+	qt := state.QType()
+	// Fail before taking the lock if the requested type is unsupported.
+	switch qt {
+	case dns.TypeA, dns.TypeAAAA, dns.TypeANY, dns.TypeCNAME:
+		break
+	default:
+		log.Debugf("Skipping query of unsupported type: %v", qt)
+		return plugin.NextOrFailure(ts.Name(), ts.Next, ctx, w, req)
+	}
 
-	// 	canAnswer = append(canAnswer, q)
-	// }
-	// if len(canAnswer) == 0 {
-	// 	return plugin.NextOrFailure(ts.Name(), ts.Next, ctx, w, r)
-	// }
+	qn := state.QName()
+	hr := func(ts *Tailscale, qn string) *record {
+		ts.RLock()
+		defer ts.RUnlock()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("recovered from panic while looking up peer host: %v", r)
+			}
+		}()
+		return ts.hosts[qn]
+	}(ts, qn)
+	if hr == nil {
+		log.Debugf("No matches for %q", qn)
+		return plugin.NextOrFailure(ts.Name(), ts.Next, ctx, w, req)
+	}
 
-	// reply := &dns.Msg{}
-	// reply.SetReply(r)
-	// hdr := dns.RR_Header{
-	// 	Name:   state.QName(),
-	// 	Rrtype: dns.TypeTXT,
-	// 	Class:  dns.ClassCHAOS,
-	// 	Ttl:    0,
-	// }
+	switch qt {
+	case dns.TypeA:
+		if len(hr.v4) == 0 {
+			break
+		}
+		return ts.serveA(ctx, w, req, qn, hr)
+	case dns.TypeAAAA:
+		if len(hr.v6) == 0 {
+			break
+		}
+		return ts.serveAAAA(ctx, w, req, qn, hr)
+	case dns.TypeANY, dns.TypeCNAME:
+		return ts.serveCNAME(ctx, w, req, qn, hr)
+	}
 
-	return plugin.NextOrFailure(ts.Name(), ts.Next, ctx, w, r)
+	// Should never reach this point.
+	return plugin.NextOrFailure(ts.Name(), ts.Next, ctx, w, req)
+}
+
+// Shutdown the Tailscale plugin.
+func (ts *Tailscale) Shutdown() {
+	log.Debug("Shutting down")
+	ts.Lock()
+	defer ts.Unlock()
+	ts.hosts = nil
+	ts.done <- true
+}
+
+// Startup the Tailscale plugin. The handler will not be usable until this is
+// called for the first time.
+func (ts *Tailscale) Startup() {
+	log.Debug("Starting up")
+	if ts.done == nil {
+		ts.done = make(chan any)
+	}
+	if ts.ReloadInterval == 0 {
+		ts.ReloadInterval = defaultReloadInterval
+	}
+	// Always reload on startup.
+	ts.reload()
+	go ts.poll(time.NewTicker(ts.ReloadInterval))
 }

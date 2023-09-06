@@ -6,14 +6,16 @@ import (
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
+	corelog "github.com/coredns/coredns/plugin/pkg/log"
 	"tailscale.com/client/tailscale"
 )
 
 // name of this plugin as coredns will refer to it.
 const name = "tailscale"
 
+var log = corelog.NewWithPlugin(name)
+
 func init() {
-	// Register as a plugin with coredns.
 	plugin.Register(name, setup)
 }
 

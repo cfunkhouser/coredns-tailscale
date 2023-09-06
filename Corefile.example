@@ -1,8 +1,0 @@
-. {
-  tailscale corp.example.com. {
-    reload 300s
-    tag campus-den den.corp.example.com.
-    tag campus-rdu rdu.corp.example.com.
-    tag prod example.com.
-  }
-}
