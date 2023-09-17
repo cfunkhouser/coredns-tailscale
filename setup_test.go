@@ -54,6 +54,9 @@ func TestParseConfig(t *testing.T) {
 			want: Config{
 				DefaultZone:    "corp.example.com.",
 				ReloadInterval: defaultReloadInterval,
+				fastZoneLookup: map[string]bool{
+					"corp.example.com.": true,
+				},
 			},
 		},
 		"empty block": {
@@ -62,6 +65,9 @@ func TestParseConfig(t *testing.T) {
 			want: Config{
 				DefaultZone:    "corp.example.com.",
 				ReloadInterval: defaultReloadInterval,
+				fastZoneLookup: map[string]bool{
+					"corp.example.com.": true,
+				},
 			},
 		},
 		"full example": {
@@ -79,6 +85,12 @@ func TestParseConfig(t *testing.T) {
 					"campus-rdu": "rdu.corp.example.com.",
 					"prod":       "example.com.",
 				},
+				fastZoneLookup: map[string]bool{
+					"corp.example.com.":     true,
+					"den.corp.example.com.": true,
+					"rdu.corp.example.com.": true,
+					"example.com.":          true,
+				},
 			},
 		},
 	} {
@@ -91,7 +103,7 @@ func TestParseConfig(t *testing.T) {
 				// Do not compare Config values when parse returns an error.
 				return
 			}
-			if diff := cmp.Diff(got, tc.want); diff != "" {
+			if diff := cmp.Diff(got, tc.want, cmpOpts...); diff != "" {
 				t.Errorf("mismatch: (-got,+want):\n%v", diff)
 			}
 		})

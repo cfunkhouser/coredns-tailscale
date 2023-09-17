@@ -19,6 +19,23 @@ func init() {
 	plugin.Register(name, setup)
 }
 
+// Config describes a mapping of Tailscale ACL tags to DNS zones on which to
+// answer about hosts.
+type Config struct {
+	// DefaultZone in which all peers should appear.
+	DefaultZone string
+
+	// Zones maps Tailscale ACL tags to additional zones in which tagged peers
+	// should appear in addition to the DefaultZone.
+	Zones map[string]string
+
+	// ReloadInterval at which polling for changes to peers should occur. Also
+	// used as the TTL for responses.
+	ReloadInterval time.Duration
+
+	fastZoneLookup map[string]bool
+}
+
 // setup the coredns tailscale plugin.
 func setup(c *caddy.Controller) error {
 	ts := Tailscale{
@@ -50,6 +67,15 @@ func setup(c *caddy.Controller) error {
 
 var defaultReloadInterval = time.Minute * 5
 
+func buildFastZoneLookup(config *Config) {
+	fzl := make(map[string]bool)
+	fzl[config.DefaultZone] = true
+	for _, zn := range config.Zones {
+		fzl[zn] = true
+	}
+	config.fastZoneLookup = fzl
+}
+
 func parse(c *caddy.Controller, config *Config) error {
 	if !c.Next() {
 		return c.ArgErr()
@@ -74,9 +100,14 @@ func parse(c *caddy.Controller, config *Config) error {
 		}
 	}
 
+	// Set default reload interval if none was provided in the Corefile.
 	if config.ReloadInterval == 0 {
 		config.ReloadInterval = defaultReloadInterval
 	}
+
+	// An optimization for faster determinations of zones handled by this
+	// server.
+	buildFastZoneLookup(config)
 	return nil
 }
 
